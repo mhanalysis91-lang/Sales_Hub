@@ -849,6 +849,522 @@
     });
   }
 
+  /* ---------- import from Excel ---------- */
+  function str(v) { return v === null || v === undefined ? "" : String(v).trim(); }
+  function key(v) { return str(v).toLowerCase(); }
+  function numOrNaN(v) { var t = str(v); return t === "" ? null : Number(t.replace(/,/g, "")); }
+  function toISO(v) {
+    if (v instanceof Date && !isNaN(v)) return new Date(v.getTime() + 12 * 3600e3).toISOString().slice(0, 10);
+    if (typeof v === "number" && v > 20000 && v < 80000) return new Date(Math.round((v - 25569) * 86400e3) + 12 * 3600e3).toISOString().slice(0, 10);
+    var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(str(v));
+    return m ? m[1] + "-" + m[2] + "-" + m[3] : "";
+  }
+
+  async function fetchAll(table, cols) {
+    var out = [], from = 0, step = 1000;
+    for (;;) {
+      var r = await sb.from(table).select(cols).order("id").range(from, from + step - 1);
+      if (r.error) throw r.error;
+      out = out.concat(r.data);
+      if (r.data.length < step) break;
+      from += step;
+    }
+    return out;
+  }
+
+  function parseSheet(wb, spec) {
+    for (var i = 0; i < wb.SheetNames.length; i++) {
+      var ws = wb.Sheets[wb.SheetNames[i]];
+      var aoa = window.XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: true, blankrows: false });
+      if (!aoa.length) continue;
+      var hdr = aoa[0].map(function (h) { return key(h); });
+      var idx = {}, good = true;
+      Object.keys(spec).forEach(function (k) {
+        var pos = -1;
+        spec[k].names.forEach(function (n) { if (pos < 0) pos = hdr.indexOf(n); });
+        idx[k] = pos;
+        if (pos < 0 && spec[k].req) good = false;
+      });
+      if (!good) continue;
+      var rows = aoa.slice(1).filter(function (r) { return r.some(function (c) { return str(c) !== ""; }); }).map(function (r) {
+        var o = {};
+        Object.keys(spec).forEach(function (k) { o[k] = idx[k] >= 0 ? r[idx[k]] : ""; });
+        return o;
+      });
+      return { rows: rows, sheet: wb.SheetNames[i] };
+    }
+    return null;
+  }
+
+  function readFile(file, spec) {
+    return new Promise(function (resolve, reject) {
+      if (!window.XLSX) { reject(new Error("The Excel reader did not load. Check your connection and reload the page.")); return; }
+      var fr = new FileReader();
+      fr.onerror = function () { reject(new Error("Could not read this file.")); };
+      fr.onload = function () {
+        try {
+          var wb = window.XLSX.read(fr.result, { type: "array", cellDates: true });
+          var res = parseSheet(wb, spec);
+          if (!res) {
+            var need = Object.keys(spec).filter(function (k) { return spec[k].req; }).map(function (k) { return spec[k].names[0]; });
+            reject(new Error("No sheet in this file has the columns: " + need.join(", ") + "."));
+          } else resolve(res);
+        } catch (e) { reject(new Error("This file could not be opened as an Excel file.")); }
+      };
+      fr.readAsArrayBuffer(file);
+    });
+  }
+
+  function chunk(list, n) {
+    var out = [];
+    for (var i = 0; i < list.length; i += n) out.push(list.slice(i, i + n));
+    return out;
+  }
+
+  function skippedWarnings(skipped) {
+    return Object.keys(skipped).map(function (k) {
+      return "Skipped " + skipped[k].n + " row" + (skipped[k].n === 1 ? "" : "s") + " for line \"" + skipped[k].name + "\", which is not in the system.";
+    });
+  }
+  function skipLine(skipped, name) {
+    var k = key(name);
+    if (!skipped[k]) skipped[k] = { name: name, n: 0 };
+    skipped[k].n++;
+  }
+
+  /* -- bricks: columns System Brick, Line, Box -- */
+  var BRICK_SPEC = {
+    brick: { names: ["system brick", "brick"], req: true },
+    line: { names: ["line"], req: true },
+    box: { names: ["box"], req: true }
+  };
+
+  function planBricks(rows, ctx) {
+    var lineByCode = {};
+    ctx.lines.forEach(function (l) { lineByCode[key(l.code)] = l; });
+    var boxKey = {};
+    ctx.boxes.forEach(function (b) { boxKey[b.lineId + "|" + key(b.name)] = b; });
+    var errors = [], desired = {}, inFile = {}, seen = {}, skipped = {};
+    rows.forEach(function (r, i) {
+      var n = i + 2, brick = str(r.brick), lc = str(r.line), bx = str(r.box);
+      if (!brick || !lc || !bx) { errors.push("Row " + n + ": brick, line and box are all required."); return; }
+      var line = lineByCode[key(lc)];
+      if (!line) { skipLine(skipped, lc); return; }
+      var box = boxKey[line.id + "|" + key(bx)];
+      if (!box) { errors.push("Row " + n + ": " + line.code + " has no box named \"" + bx + "\". Add the box first."); return; }
+      var k = line.id + "|" + key(brick);
+      if (seen[k] && seen[k] !== box.id) { errors.push("Row " + n + ": brick \"" + brick + "\" is listed under two different boxes in " + line.code + "."); return; }
+      seen[k] = box.id;
+      inFile[line.id] = line;
+      (desired[line.id] = desired[line.id] || {})[key(brick)] = { name: brick, boxId: box.id, boxName: box.name };
+    });
+    var cur = {};
+    ctx.boxes.forEach(function (b) {
+      cur[b.lineId] = cur[b.lineId] || {};
+      b.brickItems.forEach(function (it) { cur[b.lineId][key(it.name)] = { id: it.id, name: it.name, boxId: b.id, boxName: b.name }; });
+    });
+    var moves = [], adds = [], removals = [], unchanged = 0, newNames = {};
+    Object.keys(inFile).forEach(function (lid) {
+      var line = inFile[lid], d = desired[lid], c = cur[lid] || {};
+      Object.keys(d).forEach(function (k) {
+        var x = d[k], cx = c[k];
+        if (cx) {
+          if (cx.boxId === x.boxId) unchanged++;
+          else moves.push({ lineId: line.id, line: line.code, brick: x.name, id: cx.id, from: cx.boxName, toId: x.boxId, to: x.boxName });
+        } else {
+          var id = ctx.brickIds[k] || null;
+          if (!id) newNames[k] = x.name;
+          adds.push({ lineId: line.id, line: line.code, brick: x.name, key: k, id: id, from: "(not mapped)", toId: x.boxId, to: x.boxName });
+        }
+      });
+      if (ctx.removeMissing) {
+        Object.keys(c).forEach(function (k) {
+          if (!d[k]) removals.push({ lineId: line.id, line: line.code, brick: c[k].name, id: c[k].id, from: c[k].boxName, to: "(taken out)" });
+        });
+      }
+    });
+    var newCount = Object.keys(newNames).length;
+    return {
+      errors: errors,
+      warnings: skippedWarnings(skipped),
+      summary: [["Already correct", unchanged], ["Moves", moves.length], ["Bricks to map", adds.length], ["New bricks", newCount], ["Taken out", removals.length]],
+      changes: moves.length + adds.length + removals.length,
+      details: [
+        { title: "Moves between boxes", rows: moves },
+        { title: "Bricks to map", rows: adds },
+        { title: "Taken out of the line", rows: removals }
+      ],
+      apply: async function (date) {
+        var ids = {};
+        var names = Object.keys(newNames).map(function (k) { return newNames[k]; });
+        for (var c1 = 0, parts = chunk(names, 200); c1 < parts.length; c1++) {
+          var ins = await sb.from("bricks").insert(parts[c1].map(function (n) { return { name: n }; })).select("id, name");
+          if (ins.error) throw ins.error;
+          ins.data.forEach(function (x) { ids[key(x.name)] = x.id; });
+        }
+        var groups = {};
+        moves.concat(adds).forEach(function (m) {
+          var id = m.id || ids[m.key || key(m.brick)];
+          var g = m.lineId + "|" + m.toId;
+          (groups[g] = groups[g] || { lineId: m.lineId, boxId: m.toId, ids: [] }).ids.push(id);
+        });
+        var gk = Object.keys(groups);
+        for (var i = 0; i < gk.length; i++) {
+          var g = groups[gk[i]];
+          var r = await sb.rpc("move_bricks", { p_brick_ids: g.ids, p_line_id: g.lineId, p_box_id: g.boxId, p_date: date });
+          if (r.error) throw r.error;
+        }
+        var out = {};
+        removals.forEach(function (m) { (out[m.lineId] = out[m.lineId] || []).push(m.id); });
+        var ok = Object.keys(out);
+        for (var j = 0; j < ok.length; j++) {
+          var r2 = await sb.rpc("move_bricks", { p_brick_ids: out[ok[j]], p_line_id: Number(ok[j]), p_box_id: null, p_date: date });
+          if (r2.error) throw r2.error;
+        }
+      }
+    };
+  }
+
+  /* -- reps allocation: Line, Box, Medical Rep, Direct Manager (+ Region, District, Box ID for new boxes) -- */
+  var ALLOC_SPEC = {
+    line: { names: ["line"], req: true },
+    box: { names: ["box"], req: true },
+    rep: { names: ["medical rep", "rep"], req: true },
+    manager: { names: ["direct manager", "manager"], req: true },
+    region: { names: ["region"], req: false },
+    district: { names: ["district"], req: false },
+    code: { names: ["box id", "box code"], req: false },
+    rep_hire: { names: ["rep hiring date"], req: false },
+    mgr_hire: { names: ["manager hiring date"], req: false }
+  };
+
+  function planAllocation(rows, ctx) {
+    var lineByCode = {};
+    ctx.lines.forEach(function (l) { lineByCode[key(l.code)] = l; });
+    var boxKey = {};
+    ctx.boxes.forEach(function (b) { boxKey[b.lineId + "|" + key(b.name)] = b; });
+    var emp = {};
+    ctx.employees.forEach(function (e) { emp[key(e.full_name)] = e; });
+    var errors = [], warnings = [], newPeople = {}, newBoxes = [], changes = [], unchanged = 0, seen = {}, warned = {}, skipped = {};
+    function person(name, role, line, hire) {
+      var k = key(name);
+      if (emp[k]) {
+        if (emp[k].status === "In Active" && !warned[k]) { warned[k] = 1; warnings.push(name + " is marked as resigned but is listed in this file."); }
+        return { key: k, id: emp[k].id };
+      }
+      if (!newPeople[k]) {
+        var vac = k.indexOf("vacant") === 0;
+        newPeople[k] = { name: name, lineId: line.id, line: line.code, title: role, hire: hire || null, vacant: vac };
+      }
+      return { key: k, id: null };
+    }
+    rows.forEach(function (r, i) {
+      var n = i + 2, lc = str(r.line), bn = str(r.box), rn = str(r.rep), mn = str(r.manager);
+      if (!lc || !bn || !rn) { errors.push("Row " + n + ": line, box and medical rep are required."); return; }
+      var line = lineByCode[key(lc)];
+      if (!line) { skipLine(skipped, lc); return; }
+      var sk = line.id + "|" + key(bn);
+      if (seen[sk]) { errors.push("Row " + n + ": box \"" + bn + "\" appears twice in " + line.code + "."); return; }
+      seen[sk] = 1;
+      var box = boxKey[sk];
+      var region = str(r.region), district = str(r.district);
+      if (!box && !(region && district)) { errors.push("Row " + n + ": " + line.code + " has no box named \"" + bn + "\". To create it, fill in Region and District."); return; }
+      var rp = person(rn, "Medical Rep", line, toISO(r.rep_hire));
+      var mg = mn ? person(mn, "FLM", line, toISO(r.mgr_hire)) : null;
+      if (!box) {
+        newBoxes.push({ line: line, lineId: line.id, name: bn, code: str(r.code) || (bn + " " + line.code), region: region, district: district, rep: rp, mgr: mg, repName: rn, mgrName: mn });
+        return;
+      }
+      var cr = box.rep ? box.rep.id : null, cm = box.manager ? box.manager.id : null;
+      var sameRep = rp.id !== null && rp.id === cr;
+      var sameMgr = mg ? (mg.id !== null && mg.id === cm) : cm === null;
+      if (sameRep && sameMgr) { unchanged++; return; }
+      changes.push({ line: line.code, box: bn, boxId: box.id, rep: rp, mgr: mg,
+        from: (box.rep ? box.rep.full_name : "-") + " / " + (box.manager ? box.manager.full_name : "-"),
+        to: rn + " / " + (mn || "-") });
+    });
+    var people = Object.keys(newPeople).map(function (k) { return newPeople[k]; });
+    return {
+      errors: errors,
+      warnings: skippedWarnings(skipped).concat(warnings),
+      summary: [["Already correct", unchanged], ["Boxes changed", changes.length], ["New boxes", newBoxes.length], ["New people", people.length]],
+      changes: changes.length + newBoxes.length,
+      details: [
+        { title: "Rep / manager changes", rows: changes.map(function (c) { return { line: c.line, brick: c.box, from: c.from, to: c.to }; }) },
+        { title: "New boxes", rows: newBoxes.map(function (b) { return { line: b.line.code, brick: b.name, from: b.region + " / " + b.district, to: b.repName + " / " + (b.mgrName || "-") }; }) },
+        { title: "People to create", rows: people.map(function (p) { return { line: p.line, brick: p.name, from: p.title, to: p.vacant ? "Vacant placeholder" : "Active" }; }) }
+      ],
+      detailHeads: ["Line", "Box", "Now", "After"],
+      apply: async function (date) {
+        var ids = {};
+        for (var c1 = 0, parts = chunk(people, 100); c1 < parts.length; c1++) {
+          var ins = await sb.from("employees").insert(parts[c1].map(function (p) {
+            return { full_name: p.name, title: p.title, line_id: p.lineId, hire_date: p.hire, status: p.vacant ? null : "Active", is_vacant: p.vacant };
+          })).select("id, full_name");
+          if (ins.error) throw ins.error;
+          ins.data.forEach(function (x) { ids[key(x.full_name)] = x.id; });
+        }
+        function pid(p) { return p ? (p.id !== null ? p.id : ids[p.key]) : null; }
+        if (newBoxes.length) { await loadGeo(); }
+        for (var i = 0; i < newBoxes.length; i++) {
+          var b = newBoxes[i];
+          var region = state.geo.regions.filter(function (x) { return key(x.name) === key(b.region); })[0];
+          if (!region) {
+            var rr = await sb.from("regions").insert({ name: b.region }).select("id, name").single();
+            if (rr.error) throw rr.error;
+            region = { id: rr.data.id, name: b.region };
+            state.geo.regions.push(region);
+          }
+          var dist = state.geo.districts.filter(function (x) { return x.region_id === region.id && key(x.name) === key(b.district); })[0];
+          if (!dist) {
+            var dd = await sb.from("districts").insert({ region_id: region.id, name: b.district }).select("id").single();
+            if (dd.error) throw dd.error;
+            dist = { id: dd.data.id, name: b.district, region_id: region.id };
+            state.geo.districts.push(dist);
+          }
+          var rb = await sb.rpc("add_box", { p_line_id: b.lineId, p_district_id: dist.id, p_name: b.name, p_box_code: b.code, p_rep_id: pid(b.rep), p_manager_id: pid(b.mgr), p_date: date });
+          if (rb.error) throw rb.error;
+        }
+        for (var j = 0; j < changes.length; j++) {
+          var c = changes[j];
+          var rc = await sb.rpc("change_box_assignment", { p_box_id: c.boxId, p_rep_id: pid(c.rep), p_manager_id: pid(c.mgr), p_date: date });
+          if (rc.error) throw rc.error;
+        }
+      }
+    };
+  }
+
+  /* -- products: Item ID, Item Arabic Name, Item English Name, Line, Approved Price, Public Price -- */
+  var PRODUCT_SPEC = {
+    item_id: { names: ["item id"], req: true },
+    ar: { names: ["item arabic name", "arabic name"], req: false },
+    en: { names: ["item english name", "product", "english name"], req: true },
+    line: { names: ["line"], req: true },
+    approved: { names: ["approved price"], req: false },
+    pub: { names: ["public price"], req: false }
+  };
+
+  function planProducts(rows, ctx) {
+    var lineByCode = {};
+    ctx.lines.forEach(function (l) { lineByCode[key(l.code)] = l; });
+    var prod = {};
+    ctx.products.forEach(function (p) { prod[p.lineId + "|" + key(p.name)] = p; });
+    var codes = {};
+    ctx.products.forEach(function (p) { p.codes.forEach(function (c) { codes[String(c.item_id)] = { code: c, product: p }; }); });
+    var errors = [], newProducts = {}, newCodes = [], updates = [], unchanged = 0, seen = {}, skipped = {};
+    function same(a, b) { return (a === null || a === undefined || a === "") ? (b === null || b === undefined || b === "") : Number(a) === Number(b); }
+    rows.forEach(function (r, i) {
+      var n = i + 2, id = str(r.item_id), en = str(r.en), lc = str(r.line);
+      if (!id || !en || !lc) { errors.push("Row " + n + ": item ID, English name and line are required."); return; }
+      var line = lineByCode[key(lc)];
+      if (!line) { skipLine(skipped, lc); return; }
+      if (seen[id]) { errors.push("Row " + n + ": item ID " + id + " appears twice in the file."); return; }
+      seen[id] = 1;
+      var ap = numOrNaN(r.approved), pu = numOrNaN(r.pub);
+      if (ap !== null && isNaN(ap) || pu !== null && isNaN(pu)) { errors.push("Row " + n + ": prices must be numbers."); return; }
+      var ar = str(r.ar);
+      var pk = line.id + "|" + key(en);
+      var p = prod[pk];
+      var ex = codes[id];
+      if (ex) {
+        if (!p || ex.product.id !== p.id) { errors.push("Row " + n + ": item ID " + id + " already belongs to \"" + ex.product.name + "\" (" + lineName(ex.product.lineId) + ")."); return; }
+        var patch = {};
+        if (ar && ar !== (ex.code.arabic_name || "")) patch.arabic_name = ar;
+        if (ap !== null && !same(ex.code.approved_price, ap)) patch.approved_price = ap;
+        if (pu !== null && !same(ex.code.public_price, pu)) patch.public_price = pu;
+        if (Object.keys(patch).length) updates.push({ id: id, patch: patch, line: line.code, name: en });
+        else unchanged++;
+        return;
+      }
+      if (!p && !newProducts[pk]) newProducts[pk] = { lineId: line.id, line: line.code, name: en };
+      newCodes.push({ item_id: id, pk: pk, productId: p ? p.id : null, arabic_name: ar || null, approved_price: ap, public_price: pu, line: line.code, name: en });
+    });
+    var np = Object.keys(newProducts).map(function (k) { return newProducts[k]; });
+    return {
+      errors: errors,
+      warnings: skippedWarnings(skipped),
+      summary: [["Already correct", unchanged], ["New products", np.length], ["New item codes", newCodes.length], ["Codes updated", updates.length]],
+      changes: np.length + newCodes.length + updates.length,
+      details: [
+        { title: "New products", rows: np.map(function (p) { return { line: p.line, brick: p.name, from: "", to: "" }; }) },
+        { title: "New item codes", rows: newCodes.map(function (c) { return { line: c.line, brick: c.name, from: c.item_id, to: money(c.approved_price) + " / " + money(c.public_price) }; }) },
+        { title: "Codes updated", rows: updates.map(function (u) { return { line: u.line, brick: u.name, from: u.id, to: Object.keys(u.patch).join(", ") }; }) }
+      ],
+      detailHeads: ["Line", "Product", "Item ID", "Prices / change"],
+      apply: async function () {
+        var ids = {};
+        for (var c1 = 0, parts = chunk(np, 100); c1 < parts.length; c1++) {
+          var ins = await sb.from("products").insert(parts[c1].map(function (p) { return { line_id: p.lineId, name: p.name, is_active: true }; })).select("id, name, line_id");
+          if (ins.error) throw ins.error;
+          ins.data.forEach(function (x) { ids[x.line_id + "|" + key(x.name)] = x.id; });
+        }
+        var rowsOut = newCodes.map(function (c) {
+          return { item_id: c.item_id, product_id: c.productId !== null ? c.productId : ids[c.pk], arabic_name: c.arabic_name, approved_price: c.approved_price, public_price: c.public_price };
+        });
+        for (var c2 = 0, p2 = chunk(rowsOut, 200); c2 < p2.length; c2++) {
+          var r = await sb.from("product_codes").insert(p2[c2]);
+          if (r.error) throw r.error;
+        }
+        for (var i = 0; i < updates.length; i++) {
+          var u = await sb.from("product_codes").update(updates[i].patch).eq("item_id", updates[i].id);
+          if (u.error) throw u.error;
+        }
+      }
+    };
+  }
+
+  /* -- import screen -- */
+  var IMPORTERS = [
+    {
+      id: "bricks", title: "Brick mapping", spec: BRICK_SPEC, needsDate: true,
+      desc: "Columns: System Brick, Line, Box. Boxes must already exist. Each line in the file is compared with the current mapping, and only the differences are saved.",
+      options: [{ id: "remove", label: "Take out bricks that are not in the file (for the lines in the file)", on: false }],
+      context: async function (date, opts) {
+        await loadLines();
+        state.mapLoaded = false; await loadMapping();
+        var all = await fetchAll("bricks", "id, name");
+        var ids = {};
+        all.forEach(function (b) { ids[key(b.name)] = b.id; });
+        return { lines: state.lines, boxes: normalizeBoxes(state.rawBoxes, date), brickIds: ids, removeMissing: !!opts.remove };
+      },
+      plan: planBricks
+    },
+    {
+      id: "alloc", title: "Reps and managers", spec: ALLOC_SPEC, needsDate: true,
+      desc: "Columns: Line, Box, Medical Rep, Direct Manager. Add Region and District (and Box ID) to create boxes that do not exist yet. People that are not in the system are created.",
+      options: [],
+      context: async function (date) {
+        await loadLines();
+        state.mapLoaded = false; await loadMapping();
+        state.empLoaded = false; await loadEmployees();
+        state.geo = null; await loadGeo();
+        return { lines: state.lines, boxes: normalizeBoxes(state.rawBoxes, date), employees: state.employees };
+      },
+      plan: planAllocation
+    },
+    {
+      id: "products", title: "Products and item codes", spec: PRODUCT_SPEC, needsDate: false,
+      desc: "Columns: Item ID, Item Arabic Name, Item English Name, Line, Approved Price, Public Price. New products and codes are added, and changed prices are updated. An item ID that belongs to another product is reported.",
+      options: [],
+      context: async function () {
+        await loadLines();
+        state.prodLoaded = false; await loadProducts();
+        return { lines: state.lines, products: state.products };
+      },
+      plan: planProducts
+    }
+  ];
+
+  function detailTable(d, heads) {
+    var shown = d.rows.slice(0, 200);
+    var h = heads || ["Line", "Brick", "From", "To"];
+    var table = el("table", { class: "codes" }, [
+      el("thead", {}, [el("tr", {}, h.map(function (x) { return el("th", { text: x }); }))]),
+      el("tbody", {}, shown.map(function (r) {
+        return el("tr", {}, [el("td", { text: r.line }), el("td", { text: r.brick }), el("td", { text: r.from }), el("td", { text: r.to })]);
+      }))
+    ]);
+    var box = el("details", { class: "dt" }, [el("summary", { text: d.title + " (" + d.rows.length + ")" }), el("div", { class: "scroll" }, [table])]);
+    if (d.rows.length > shown.length) box.appendChild(el("p", { class: "muted", text: "Showing the first " + shown.length + " of " + d.rows.length + "." }));
+    return box;
+  }
+
+  function buildImportCard(imp) {
+    var card = el("div", { class: "panel wide", id: "imp-" + imp.id });
+    card.appendChild(el("h2", { text: imp.title }));
+    card.appendChild(el("p", { class: "muted", text: imp.desc }));
+    var row = el("div", { class: "imp-row" });
+    var file = el("input", { type: "file", accept: ".xlsx,.xls,.csv", "aria-label": "Choose a file for " + imp.title, "data-imp": "file" });
+    row.appendChild(file);
+    var date = null;
+    if (imp.needsDate) {
+      date = el("input", { type: "date", value: nextMonthStart(), "aria-label": "Effective from", "data-imp": "date" });
+      row.appendChild(el("label", { class: "inline", text: "Effective from" }));
+      row.appendChild(date);
+    }
+    card.appendChild(row);
+    var opts = {};
+    imp.options.forEach(function (o) {
+      var cb = el("input", { type: "checkbox", "data-imp": "opt-" + o.id });
+      cb.checked = !!o.on;
+      opts[o.id] = cb;
+      card.appendChild(el("label", { class: "optline" }, [cb, document.createTextNode(o.label)]));
+    });
+    var go = el("button", { type: "button", class: "btn accent", text: "Preview changes", "data-imp": "preview" });
+    var msg = el("p", { class: "error", role: "alert" });
+    var out = el("div", { class: "result" });
+    card.appendChild(el("div", { class: "imp-row" }, [go]));
+    card.appendChild(msg);
+    card.appendChild(out);
+
+    go.addEventListener("click", async function () {
+      msg.textContent = ""; out.textContent = "";
+      if (!file.files || !file.files[0]) { msg.textContent = "Choose an Excel file first."; return; }
+      var d = date ? date.value : "";
+      if (imp.needsDate && !d) { msg.textContent = "Choose the effective date."; return; }
+      go.disabled = true; go.textContent = "Reading...";
+      try {
+        var parsed = await readFile(file.files[0], imp.spec);
+        var o = {};
+        Object.keys(opts).forEach(function (k) { o[k] = opts[k].checked; });
+        var ctx = await imp.context(d, o);
+        var plan = imp.plan(parsed.rows, ctx);
+        renderPlan(out, imp, plan, d, parsed);
+      } catch (e) {
+        msg.textContent = friendly(e);
+      }
+      go.disabled = false; go.textContent = "Preview changes";
+    });
+    return card;
+  }
+
+  function renderPlan(out, imp, plan, date, parsed) {
+    out.textContent = "";
+    out.appendChild(el("p", { class: "muted", text: "Read " + parsed.rows.length + " rows from the sheet \"" + parsed.sheet + "\"." }));
+    var stats = el("div", { class: "stats", style: "grid-template-columns: repeat(" + plan.summary.length + ", minmax(0, 1fr))" });
+    plan.summary.forEach(function (s) {
+      stats.appendChild(el("div", { class: "stat" }, [el("div", { class: "n", text: String(s[1]) }), el("div", { class: "l", text: s[0] })]));
+    });
+    out.appendChild(stats);
+    if (plan.errors.length) {
+      var shownErr = plan.errors.slice(0, 50);
+      out.appendChild(el("p", { class: "error", text: plan.errors.length + " problem" + (plan.errors.length === 1 ? "" : "s") + " found. Fix the file and preview again." }));
+      out.appendChild(el("ul", { class: "problems" }, shownErr.map(function (t) { return el("li", { text: t }); })));
+      if (plan.errors.length > shownErr.length) out.appendChild(el("p", { class: "muted", text: "Showing the first " + shownErr.length + "." }));
+    }
+    if (plan.warnings.length) {
+      out.appendChild(el("ul", { class: "problems warn" }, plan.warnings.slice(0, 20).map(function (t) { return el("li", { text: t }); })));
+    }
+    plan.details.forEach(function (d) { if (d.rows.length) out.appendChild(detailTable(d, plan.detailHeads)); });
+    if (!plan.errors.length) {
+      if (!plan.changes) { out.appendChild(el("p", { class: "muted", text: "Nothing to change. The system already matches this file." })); return; }
+      var ap = el("button", { type: "button", class: "btn accent", text: "Apply changes", "data-imp": "apply" });
+      ap.addEventListener("click", function () {
+        openForm({
+          title: "Apply " + imp.title.toLowerCase(),
+          intro: plan.summary.filter(function (s) { return s[1] && s[0] !== "Already correct"; }).map(function (s) { return s[1] + " " + s[0].toLowerCase(); }).join(", ") + (imp.needsDate ? ". Takes effect on " + date + "; earlier months keep the old mapping." : "."),
+          submitLabel: "Apply changes",
+          fields: [],
+          onSubmit: async function () {
+            await plan.apply(date);
+            state.mapLoaded = false; state.prodLoaded = false; state.empLoaded = false; state.geo = null;
+            out.textContent = "";
+            toast("Changes applied." + (imp.needsDate ? effectiveNote(date) : ""));
+          }
+        });
+      });
+      out.appendChild(el("div", { class: "imp-row" }, [ap]));
+    }
+  }
+
+  var importBuilt = false;
+  function renderImport() {
+    if (importBuilt) return;
+    importBuilt = true;
+    var root = $("import-root");
+    IMPORTERS.forEach(function (imp) { root.appendChild(buildImportCard(imp)); });
+  }
+
   /* ---------- data ---------- */
   async function loadLines() {
     if (state.lines.length) return;
@@ -910,6 +1426,7 @@
   var ROUTES = {
     mapping: { title: "Mapping", load: loadMapping, render: renderMapping },
     products: { title: "Products", load: loadProducts, render: renderProducts },
+    import: { title: "Import", load: null, render: renderImport },
     people: { title: "People", load: async function () { await loadLines(); await loadMapping(); await loadEmployees(); }, render: renderPeople },
     settings: { title: "Settings", load: null, render: function () { $("settings-email").textContent = state.user ? state.user.email : ""; } }
   };
@@ -1040,5 +1557,5 @@
     }
   })();
 
-  window.__salesHub = { normalizeBoxes: normalizeBoxes, isCurrent: isCurrent };
+  window.__salesHub = { normalizeBoxes: normalizeBoxes, isCurrent: isCurrent, planBricks: planBricks, planAllocation: planAllocation, planProducts: planProducts, toISO: toISO };
 })();
