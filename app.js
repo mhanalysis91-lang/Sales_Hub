@@ -3,7 +3,7 @@
 
   var cfg = window.SALES_HUB_CONFIG;
   var sb = window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_ANON_KEY);
-  var state = { user: null, lines: [], boxes: [], products: [], mapLoaded: false, prodLoaded: false, lineId: null, open: {}, popen: {}, q: "", pq: "" };
+  var state = { user: null, lines: [], rawBoxes: [], boxes: [], products: [], employees: [], geo: null, mapLoaded: false, prodLoaded: false, empLoaded: false, lineId: null, open: {}, popen: {}, q: "", pq: "", eq: "", eLine: "all", eShow: "active", asOf: "" };
 
   function $(id) { return document.getElementById(id); }
   function all(sel) { return Array.prototype.slice.call(document.querySelectorAll(sel)); }
@@ -78,23 +78,33 @@
     return Number(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
-  function normalizeBoxes(boxes) {
-    var today = todayStr();
+  function nextMonthStart() {
+    var d = new Date();
+    var y = d.getFullYear(), m = d.getMonth() + 2;
+    if (m > 12) { m = 1; y++; }
+    return y + "-" + String(m).padStart(2, "0") + "-01";
+  }
+
+  function normalizeBoxes(boxes, asOf) {
+    var today = asOf || todayStr();
     return boxes.map(function (b) {
       var a = pickCurrent(b.box_assignments, today);
-      var bricks = (b.brick_box_map || [])
+      var items = (b.brick_box_map || [])
         .filter(function (r) { return isCurrent(r, today) && r.bricks; })
-        .map(function (r) { return r.bricks.name; })
-        .sort(natural);
+        .map(function (r) { return { id: r.bricks.id, name: r.bricks.name }; })
+        .sort(function (x, y) { return natural(x.name, y.name); });
+      var bricks = items.map(function (x) { return x.name; });
       return {
         id: b.id,
         name: b.name,
         lineId: b.line_id,
         district: b.districts ? b.districts.name : "",
         region: b.districts && b.districts.regions ? b.districts.regions.name : "",
+        districtId: b.district_id || null,
         rep: a && a.rep ? a.rep : null,
         manager: a && a.manager ? a.manager : null,
-        bricks: bricks
+        bricks: bricks,
+        brickItems: items
       };
     });
   }
@@ -181,9 +191,19 @@
     cfg.fields.forEach(function (f) {
       var id = "f-" + f.name;
       var wrap = el("div", { class: "field" });
-      wrap.appendChild(el("label", { "for": id, text: f.label + (f.required ? "" : " (optional)") }));
+      wrap.appendChild(f.type === "checks"
+        ? el("div", { class: "lbl", text: f.label })
+        : el("label", { "for": id, text: f.label + (f.required ? "" : " (optional)") }));
       var input;
-      if (f.type === "select") {
+      if (f.type === "checks") {
+        input = el("div", { id: id, class: "checks", role: "group" });
+        f.options.forEach(function (o) {
+          var cb = el("input", { type: "checkbox", value: String(o.value) });
+          input.appendChild(el("label", {}, [cb, document.createTextNode(o.label)]));
+        });
+      } else if (f.type === "textarea") {
+        input = el("textarea", { id: id, name: f.name, rows: "6" });
+      } else if (f.type === "select") {
         input = el("select", { id: id, name: f.name });
         f.options.forEach(function (o) { input.appendChild(el("option", { value: String(o.value), text: o.label })); });
       } else {
@@ -195,7 +215,7 @@
       if (f.readonly) input.readOnly = true;
       if (f.required) input.setAttribute("aria-required", "true");
       if (f.type === "select") { if (f.value !== undefined && f.value !== null) input.value = String(f.value); else input.selectedIndex = 0; }
-      else input.value = f.value === undefined || f.value === null ? "" : String(f.value);
+      else if (f.type !== "checks") input.value = f.value === undefined || f.value === null ? "" : String(f.value);
       wrap.appendChild(input);
       if (f.hint) wrap.appendChild(el("p", { class: "hint", text: f.hint }));
       form.appendChild(wrap);
@@ -217,7 +237,7 @@
     function onKey(ev) {
       if (ev.key === "Escape") { ev.stopPropagation(); close(); return; }
       if (ev.key !== "Tab") return;
-      var f = Array.prototype.slice.call(form.querySelectorAll("input:not([readonly]), select, button:not(:disabled)"));
+      var f = Array.prototype.slice.call(form.querySelectorAll("input:not([readonly]), select, textarea, button:not(:disabled)"));
       if (!f.length) return;
       var first = f[0], last = f[f.length - 1];
       if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
@@ -233,6 +253,12 @@
       var values = {};
       for (var i = 0; i < cfg.fields.length; i++) {
         var f = cfg.fields[i];
+        if (f.type === "checks") {
+          var picked = Array.prototype.slice.call(inputs[f.name].querySelectorAll("input:checked")).map(function (c) { return c.value; });
+          if (f.required && !picked.length) { err.textContent = f.requiredMsg || (f.label + " is required."); return; }
+          values[f.name] = picked;
+          continue;
+        }
         var v = inputs[f.name].value.trim();
         if (f.required && !v) {
           err.textContent = f.label + " is required.";
@@ -259,7 +285,10 @@
     });
 
     var firstEditable = cfg.fields.length ? inputs[cfg.fields.filter(function (f) { return !f.readonly; }).map(function (f) { return f.name; })[0]] : null;
-    if (firstEditable) firstEditable.focus();
+    if (firstEditable) {
+      var fe = firstEditable.tagName === "DIV" ? firstEditable.querySelector("input") : firstEditable;
+      if (fe) fe.focus();
+    }
     return { close: close, inputs: inputs };
   }
 
@@ -271,6 +300,7 @@
   }
 
   function renderMapping() {
+    if ($("as-of").value !== state.asOf) $("as-of").value = state.asOf;
     renderTabs("tabs");
     var rows = state.boxes.filter(function (b) { return b.lineId === state.lineId; }).sort(function (a, b) { return natural(a.name, b.name); });
     var vacant = rows.filter(function (b) { return b.rep && b.rep.is_vacant; }).length;
@@ -301,7 +331,271 @@
         var content = b.bricks.length
           ? el("div", { class: "chips" }, b.bricks.map(function (n) { return el("span", { class: "chip", text: n }); }))
           : el("p", { class: "muted", text: "No bricks assigned to this box." });
-        body.appendChild(el("tr", { class: "detail" }, [el("td", { colspan: "6" }, [content])]));
+        body.appendChild(el("tr", { class: "detail" }, [el("td", { colspan: "6" }, [boxActions(b), content])]));
+      }
+    });
+  }
+
+  /* ---------- mapping: edit actions ---------- */
+  function boxActions(b) {
+    function btn(label, act, fn) {
+      var x = el("button", { type: "button", class: "btn sm", "data-act": act, text: label });
+      x.addEventListener("click", fn);
+      return x;
+    }
+    return el("div", { class: "actions" }, [
+      btn("Change rep / manager", "assign", function () { changeAssignment(b); }),
+      btn("Move bricks out", "move-bricks", function () { moveBricksOut(b); }),
+      btn("Add bricks", "add-bricks", function () { addBricks(b); })
+    ]);
+  }
+
+  function dateField(label) {
+    return { name: "date", label: label || "Effective from", type: "date", required: true, value: nextMonthStart(), hint: "Earlier months keep the old mapping." };
+  }
+
+  function peopleOptions(lineId, current, opts) {
+    var list = state.employees.filter(function (e) {
+      return e.status !== "In Active" || (current && e.id === current);
+    }).sort(function (a, b) {
+      var am = a.line_id === lineId ? 0 : 1, bm = b.line_id === lineId ? 0 : 1;
+      return am - bm || natural(a.full_name, b.full_name);
+    });
+    var out = (opts && opts.none) ? [{ value: "", label: opts.none }] : [];
+    return out.concat(list.map(function (e) {
+      return { value: e.id, label: e.full_name + (e.title ? " (" + e.title + ")" : "") };
+    }));
+  }
+
+  async function withRefs(fn) {
+    try { await loadEmployees(); await loadGeo(); fn(); }
+    catch (e) { $("app-error").textContent = "Could not load the list of people: " + friendly(e); }
+  }
+
+  function effectiveNote(date) {
+    return date <= todayStr() ? "" : " It takes effect on " + date + ".";
+  }
+
+  function changeAssignment(b) {
+    withRefs(function () {
+      openForm({
+        title: "Change rep / manager for " + b.name,
+        submitLabel: "Save change",
+        fields: [
+          { name: "rep", label: "Rep", type: "select", required: true, value: b.rep ? b.rep.id : undefined, options: peopleOptions(b.lineId, b.rep && b.rep.id) },
+          { name: "manager", label: "Manager", type: "select", value: b.manager ? b.manager.id : "", options: peopleOptions(b.lineId, b.manager && b.manager.id, { none: "No manager" }) },
+          dateField()
+        ],
+        onSubmit: async function (v) {
+          var r = await sb.rpc("change_box_assignment", { p_box_id: b.id, p_rep_id: Number(v.rep), p_manager_id: v.manager ? Number(v.manager) : null, p_date: v.date });
+          if (r.error) throw r.error;
+          await refreshMapping();
+          toast("Saved." + effectiveNote(v.date));
+        }
+      });
+    });
+  }
+
+  function moveBricksOut(b) {
+    if (!b.brickItems.length) { $("app-error").textContent = b.name + " has no bricks to move on the date being shown."; return; }
+    var targets = state.boxes.filter(function (x) { return x.lineId === b.lineId && x.id !== b.id; }).sort(function (a, c) { return natural(a.name, c.name); });
+    var opts = targets.map(function (x) { return { value: x.id, label: x.name }; });
+    opts.push({ value: "", label: "No box (take out of this line)" });
+    openForm({
+      title: "Move bricks out of " + b.name,
+      submitLabel: "Move bricks",
+      fields: [
+        { name: "bricks", label: "Bricks to move", type: "checks", required: true, requiredMsg: "Select at least one brick.", options: b.brickItems.map(function (x) { return { value: x.id, label: x.name }; }) },
+        { name: "target", label: "Move to box", type: "select", options: opts },
+        dateField()
+      ],
+      onSubmit: async function (v) {
+        var r = await sb.rpc("move_bricks", { p_brick_ids: v.bricks.map(Number), p_line_id: b.lineId, p_box_id: v.target ? Number(v.target) : null, p_date: v.date });
+        if (r.error) throw r.error;
+        await refreshMapping();
+        toast(v.bricks.length + (v.bricks.length === 1 ? " brick moved." : " bricks moved.") + effectiveNote(v.date));
+      }
+    });
+  }
+
+  function addBricks(b) {
+    openForm({
+      title: "Add bricks to " + b.name,
+      intro: "A brick that belongs to another box in this line moves here from the date. A new brick name is created.",
+      submitLabel: "Add bricks",
+      fields: [
+        { name: "names", label: "Brick names", type: "textarea", required: true, hint: "One per line." },
+        dateField()
+      ],
+      onSubmit: async function (v) {
+        var names = [];
+        v.names.split(/\r?\n|,/).forEach(function (n) { n = n.trim(); if (n && names.indexOf(n) === -1) names.push(n); });
+        if (!names.length) throw new Error("Enter at least one brick name.");
+        var ex = await sb.from("bricks").select("id, name").in("name", names);
+        if (ex.error) throw ex.error;
+        var have = {};
+        ex.data.forEach(function (x) { have[x.name] = x.id; });
+        var missing = names.filter(function (n) { return !(n in have); });
+        var created = 0;
+        if (missing.length) {
+          var ins = await sb.from("bricks").insert(missing.map(function (n) { return { name: n }; })).select("id, name");
+          if (ins.error) throw ins.error;
+          ins.data.forEach(function (x) { have[x.name] = x.id; });
+          created = ins.data.length;
+        }
+        var ids = names.map(function (n) { return have[n]; });
+        var r = await sb.rpc("move_bricks", { p_brick_ids: ids, p_line_id: b.lineId, p_box_id: b.id, p_date: v.date });
+        if (r.error) throw r.error;
+        await refreshMapping();
+        toast(ids.length + (ids.length === 1 ? " brick added" : " bricks added") + (created ? " (" + created + " new)." : ".") + effectiveNote(v.date));
+      }
+    });
+  }
+
+  function addBox() {
+    withRefs(function () {
+      var line = state.lineId;
+      var districts = state.geo.districts.slice().sort(function (a, c) { return natural(a.name, c.name); });
+      openForm({
+        title: "Add box to " + lineName(line),
+        submitLabel: "Add box",
+        dupMsg: "This line already has a box with that name.",
+        fields: [
+          { name: "name", label: "Box name", required: true },
+          { name: "district", label: "District", type: "select", options: districts.map(function (d) { return { value: d.id, label: d.name + (d.regions ? " - " + d.regions.name : "") }; }).concat([{ value: "", label: "A new district (fill in below)" }]) },
+          { name: "new_district", label: "New district name", hint: "Only if the district is not in the list above." },
+          { name: "region", label: "Region of the new district", type: "select", options: state.geo.regions.map(function (r) { return { value: r.id, label: r.name }; }) },
+          { name: "rep", label: "Rep", type: "select", options: peopleOptions(line, null, { none: "Not assigned yet" }) },
+          { name: "manager", label: "Manager", type: "select", options: peopleOptions(line, null, { none: "No manager" }) },
+          dateField("Starts on")
+        ],
+        onSubmit: async function (v) {
+          var districtId = v.district ? Number(v.district) : null;
+          if (v.new_district) {
+            var d = await sb.from("districts").insert({ region_id: Number(v.region), name: v.new_district }).select("id").single();
+            if (d.error) throw d.error;
+            districtId = d.data.id;
+            state.geo = null;
+          }
+          if (!districtId) throw new Error("Choose a district, or type the name of a new one.");
+          var r = await sb.rpc("add_box", { p_line_id: line, p_district_id: districtId, p_name: v.name, p_box_code: v.name + " " + lineName(line), p_rep_id: v.rep ? Number(v.rep) : null, p_manager_id: v.manager ? Number(v.manager) : null, p_date: v.date });
+          if (r.error) throw r.error;
+          await refreshMapping();
+          toast("Box added.");
+        }
+      });
+    });
+  }
+
+  /* ---------- people view ---------- */
+  function personBoxes(id) {
+    var n = 0;
+    state.boxes.forEach(function (b) {
+      if ((b.rep && b.rep.id === id) || (b.manager && b.manager.id === id)) n++;
+    });
+    return n;
+  }
+
+  function renderPeople() {
+    var box = $("e-tabs");
+    box.textContent = "";
+    [{ id: "all", code: "All" }].concat(state.lines).forEach(function (l) {
+      var btn = el("button", { type: "button", role: "tab", text: l.code, "aria-selected": String(l.id === state.eLine) });
+      btn.addEventListener("click", function () { state.eLine = l.id; renderPeople(); });
+      box.appendChild(btn);
+    });
+    var q = state.eq.trim().toLowerCase();
+    var rows = state.employees.filter(function (e) {
+      if (state.eLine !== "all" && e.line_id !== state.eLine) return false;
+      if (state.eShow === "active" && e.status === "In Active") return false;
+      if (state.eShow === "resigned" && e.status !== "In Active") return false;
+      if (!q) return true;
+      return [e.full_name, e.arabic_name || "", e.title || ""].join(" ").toLowerCase().indexOf(q) !== -1;
+    });
+    var real = rows.filter(function (e) { return !e.is_vacant; });
+    renderStats("e-stats", [["People shown", real.length], ["Vacant placeholders", rows.length - real.length], ["Resigned", rows.filter(function (e) { return e.status === "In Active"; }).length]]);
+    var body = $("people-body");
+    body.textContent = "";
+    $("e-empty").hidden = rows.length > 0;
+    rows.forEach(function (e) {
+      var tr = el("tr", { class: "row static" });
+      var nm = el("td", { class: "name" }, [document.createTextNode(e.full_name)]);
+      if (e.is_vacant) nm.appendChild(el("span", { class: "badge", text: "Vacant" }));
+      tr.appendChild(nm);
+      tr.appendChild(el("td", { "data-label": "Title", text: e.title || "-" }));
+      tr.appendChild(el("td", { "data-label": "Line", text: e.line_id ? lineName(e.line_id) : "-" }));
+      var resigned = e.status === "In Active";
+      tr.appendChild(el("td", { "data-label": "Status" }, [el("span", { class: "badge " + (resigned ? "off" : "ok"), text: resigned ? "Resigned " + (e.resignation_date || "") : "Active" })]));
+      tr.appendChild(el("td", { class: "num", "data-label": "Boxes now", text: String(personBoxes(e.id)) }));
+      var act = el("td", { class: "act" });
+      if (!e.is_vacant) {
+        var b = el("button", { type: "button", class: "btn sm", "data-act": resigned ? "reactivate" : "resign", text: resigned ? "Reactivate" : "Mark resigned" });
+        b.addEventListener("click", function () { resigned ? reactivatePerson(e) : resignPerson(e); });
+        act.appendChild(b);
+      }
+      tr.appendChild(act);
+      body.appendChild(tr);
+    });
+  }
+
+  async function refreshPeople() {
+    state.empLoaded = false;
+    await loadEmployees();
+    renderPeople();
+  }
+
+  function addPerson() {
+    openForm({
+      title: "Add person",
+      submitLabel: "Add person",
+      dupMsg: "Someone with this name already exists.",
+      fields: [
+        { name: "full_name", label: "Full name", required: true },
+        { name: "arabic_name", label: "Arabic name", dir: "rtl" },
+        { name: "title", label: "Title", hint: "For example: Medical Rep, Line Manager." },
+        { name: "line_id", label: "Line", type: "select", options: [{ value: "", label: "No line" }].concat(state.lines.map(function (l) { return { value: l.id, label: l.code }; })) },
+        { name: "hire_date", label: "Hire date", type: "date" }
+      ],
+      onSubmit: async function (v) {
+        var r = await sb.from("employees").insert({
+          full_name: v.full_name, arabic_name: v.arabic_name || null, title: v.title || null,
+          line_id: v.line_id ? Number(v.line_id) : null, hire_date: v.hire_date || null,
+          status: "Active", is_vacant: false
+        });
+        if (r.error) throw r.error;
+        await refreshPeople();
+        toast("Person added. Assign them to a box in Mapping.");
+      }
+    });
+  }
+
+  function resignPerson(e) {
+    var n = personBoxes(e.id);
+    openForm({
+      title: "Mark " + e.full_name + " as resigned",
+      intro: n ? e.full_name + " covers " + n + (n === 1 ? " box" : " boxes") + " today. Their boxes are not reassigned automatically; change them in Mapping." : "",
+      submitLabel: "Mark resigned",
+      fields: [{ name: "date", label: "Last working day", type: "date", required: true, value: todayStr() }],
+      onSubmit: async function (v) {
+        var r = await sb.from("employees").update({ status: "In Active", resignation_date: v.date }).eq("id", e.id);
+        if (r.error) throw r.error;
+        await refreshPeople();
+        toast("Marked as resigned.");
+      }
+    });
+  }
+
+  function reactivatePerson(e) {
+    openForm({
+      title: "Reactivate " + e.full_name,
+      intro: "They will be listed as active again and can be assigned to boxes.",
+      submitLabel: "Reactivate",
+      fields: [],
+      onSubmit: async function () {
+        var r = await sb.from("employees").update({ status: "Active", resignation_date: null }).eq("id", e.id);
+        if (r.error) throw r.error;
+        await refreshPeople();
+        toast("Person reactivated.");
       }
     });
   }
@@ -508,18 +802,30 @@
     var next = state.lines.reduce(function (m, l) { return Math.max(m, l.sort_order || 0); }, 0) + 1;
     openForm({
       title: "Add line", submitLabel: "Add line",
-      intro: "You can add its products here, then its boxes and bricks in Mapping.",
+      intro: "Then add its products in Products and its reps in Mapping.",
       dupMsg: "A line with this name already exists.",
-      fields: [{ name: "code", label: "Line name", required: true, hint: "For example: CIRA 4" }],
+      fields: [
+        { name: "code", label: "Line name", required: true, hint: "For example: CIRA 4" },
+        { name: "copy", label: "Start from the boxes and bricks of", type: "select", options: [{ value: "", label: "Nothing (empty line)" }].concat(state.lines.map(function (l) { return { value: l.id, label: l.code }; })), hint: "Copies the boxes and brick distribution only, not reps or managers." },
+        { name: "date", label: "Copied mapping starts on", type: "date", value: nextMonthStart() }
+      ],
       onSubmit: async function (v) {
+        if (v.copy && !v.date) throw new Error("Choose the date the copied mapping starts on.");
         var r = await sb.from("lines").insert({ code: v.code, sort_order: next, is_active: true }).select("id").single();
         if (r.error) throw r.error;
+        var failed = "";
+        if (v.copy) {
+          var c = await sb.rpc("copy_line_structure", { p_src_line: Number(v.copy), p_dst_line: r.data.id, p_date: v.date });
+          if (c.error) failed = friendly(c.error);
+        }
         state.lines = [];
         await loadLines();
         state.lineId = r.data.id;
         state.mapLoaded = false;
-        await refreshProducts();
-        toast("Line added.");
+        state.prodLoaded = false;
+        await route();
+        if (failed) $("app-error").textContent = "The line was added, but its boxes were not copied: " + failed;
+        else toast(v.copy ? "Line added with its boxes and bricks." : "Line added.");
       }
     });
   }
@@ -556,15 +862,39 @@
     if (state.mapLoaded) return;
     await loadLines();
     var b = await sb.from("boxes").select(
-      "id, name, line_id, districts(name, regions(name)), " +
+      "id, name, line_id, district_id, districts(name, regions(name)), " +
       "box_assignments(valid_from, valid_to, " +
-      "rep:employees!box_assignments_rep_id_fkey(full_name, is_vacant), " +
-      "manager:employees!box_assignments_manager_id_fkey(full_name, is_vacant)), " +
-      "brick_box_map(valid_from, valid_to, bricks(name))"
+      "rep:employees!box_assignments_rep_id_fkey(id, full_name, is_vacant), " +
+      "manager:employees!box_assignments_manager_id_fkey(id, full_name, is_vacant)), " +
+      "brick_box_map(valid_from, valid_to, bricks(id, name))"
     );
     if (b.error) throw b.error;
-    state.boxes = normalizeBoxes(b.data);
+    state.rawBoxes = b.data;
+    state.boxes = normalizeBoxes(state.rawBoxes, state.asOf);
     state.mapLoaded = true;
+  }
+
+  async function loadEmployees() {
+    if (state.empLoaded) return;
+    var e = await sb.from("employees").select("id, full_name, arabic_name, title, line_id, hire_date, resignation_date, status, is_vacant").order("full_name");
+    if (e.error) throw e.error;
+    state.employees = e.data;
+    state.empLoaded = true;
+  }
+
+  async function loadGeo() {
+    if (state.geo) return;
+    var d = await sb.from("districts").select("id, name, region_id, regions(id, name)").order("name");
+    if (d.error) throw d.error;
+    var r = await sb.from("regions").select("id, name").order("name");
+    if (r.error) throw r.error;
+    state.geo = { districts: d.data, regions: r.data };
+  }
+
+  async function refreshMapping() {
+    state.mapLoaded = false;
+    await loadMapping();
+    renderMapping();
   }
 
   async function loadProducts() {
@@ -580,6 +910,7 @@
   var ROUTES = {
     mapping: { title: "Mapping", load: loadMapping, render: renderMapping },
     products: { title: "Products", load: loadProducts, render: renderProducts },
+    people: { title: "People", load: async function () { await loadLines(); await loadMapping(); await loadEmployees(); }, render: renderPeople },
     settings: { title: "Settings", load: null, render: function () { $("settings-email").textContent = state.user ? state.user.email : ""; } }
   };
 
@@ -654,7 +985,8 @@
   }
 
   function resetState() {
-    state.user = null; state.lines = []; state.boxes = []; state.products = [];
+    state.user = null; state.lines = []; state.boxes = []; state.rawBoxes = []; state.products = []; state.employees = []; state.geo = null;
+    state.empLoaded = false; state.asOf = "";
     state.mapLoaded = false; state.prodLoaded = false; state.lineId = null; state.open = {}; state.popen = {};
   }
 
@@ -686,6 +1018,16 @@
   $("search").addEventListener("input", function (ev) { state.q = ev.target.value; renderMapping(); });
   $("p-search").addEventListener("input", function (ev) { state.pq = ev.target.value; renderProducts(); });
   $("add-product").addEventListener("click", addProduct);
+  $("add-box").addEventListener("click", addBox);
+  $("add-line-m").addEventListener("click", addLine);
+  $("add-person").addEventListener("click", addPerson);
+  $("e-search").addEventListener("input", function (ev) { state.eq = ev.target.value; renderPeople(); });
+  $("e-show").addEventListener("change", function (ev) { state.eShow = ev.target.value; renderPeople(); });
+  $("as-of").addEventListener("change", function (ev) {
+    state.asOf = ev.target.value;
+    state.boxes = normalizeBoxes(state.rawBoxes, state.asOf);
+    renderMapping();
+  });
   $("add-line").addEventListener("click", addLine);
 
   (async function init() {

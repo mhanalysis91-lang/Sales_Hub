@@ -13,3 +13,4 @@ Sales reporting system (CIRA 1/2/3 + OTC lines), built on Supabase + GitHub Page
 2. `supabase/02_data.sql` - initial mapping data (generated locally, NOT in this repo)
 3. `supabase/03_auth.sql` - admin-only access
 4. `supabase/04_make_admin.sql` - marks the login as admin (NOT in this repo)
+5. `supabase/05_edit_functions.sql` - functions used by the edit screens (move bricks, change rep/manager, add box, copy line)
