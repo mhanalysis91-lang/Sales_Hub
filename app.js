@@ -154,6 +154,115 @@
     return td;
   }
 
+  /* ---------- forms, toast, errors ---------- */
+  function toast(msg) {
+    var old = document.getElementById("toast");
+    if (old) old.remove();
+    var t = el("div", { id: "toast", class: "toast", role: "status", text: msg });
+    document.body.appendChild(t);
+    setTimeout(function () { if (t.parentNode) t.remove(); }, 3500);
+  }
+
+  function friendly(e, dupMsg) {
+    var code = e && e.code;
+    if (code === "23505") return dupMsg || "That already exists.";
+    if (code === "23503") return "This refers to something that no longer exists. Reload the page and try again.";
+    if (code === "42501") return "You do not have permission to make this change.";
+    return (e && e.message) ? e.message : String(e);
+  }
+
+  function openForm(cfg) {
+    var lastFocus = document.activeElement;
+    var backdrop = el("div", { class: "modal-backdrop" });
+    var form = el("form", { class: "modal", role: "dialog", "aria-modal": "true", "aria-labelledby": "modal-title", novalidate: "novalidate" });
+    form.appendChild(el("h2", { id: "modal-title", text: cfg.title }));
+    if (cfg.intro) form.appendChild(el("p", { class: "muted intro", text: cfg.intro }));
+    var inputs = {};
+    cfg.fields.forEach(function (f) {
+      var id = "f-" + f.name;
+      var wrap = el("div", { class: "field" });
+      wrap.appendChild(el("label", { "for": id, text: f.label + (f.required ? "" : " (optional)") }));
+      var input;
+      if (f.type === "select") {
+        input = el("select", { id: id, name: f.name });
+        f.options.forEach(function (o) { input.appendChild(el("option", { value: String(o.value), text: o.label })); });
+      } else {
+        input = el("input", { id: id, name: f.name, type: f.type || "text", autocomplete: "off" });
+        if (f.type === "number") { input.setAttribute("step", "0.01"); input.setAttribute("min", "0"); input.setAttribute("inputmode", "decimal"); }
+        if (f.type === "date") input.setAttribute("min", "2000-01-01");
+      }
+      if (f.dir) input.setAttribute("dir", f.dir);
+      if (f.readonly) input.readOnly = true;
+      if (f.required) input.setAttribute("aria-required", "true");
+      if (f.type === "select") { if (f.value !== undefined && f.value !== null) input.value = String(f.value); else input.selectedIndex = 0; }
+      else input.value = f.value === undefined || f.value === null ? "" : String(f.value);
+      wrap.appendChild(input);
+      if (f.hint) wrap.appendChild(el("p", { class: "hint", text: f.hint }));
+      form.appendChild(wrap);
+      inputs[f.name] = input;
+    });
+    var err = el("p", { class: "error", role: "alert" });
+    form.appendChild(err);
+    var cancel = el("button", { type: "button", class: "btn", text: "Cancel" });
+    var save = el("button", { type: "submit", class: "btn accent", text: cfg.submitLabel || "Save" });
+    form.appendChild(el("div", { class: "modal-actions" }, [cancel, save]));
+    backdrop.appendChild(form);
+    document.body.appendChild(backdrop);
+
+    function close() {
+      document.removeEventListener("keydown", onKey, true);
+      backdrop.remove();
+      if (lastFocus && lastFocus.focus && document.body.contains(lastFocus)) lastFocus.focus();
+    }
+    function onKey(ev) {
+      if (ev.key === "Escape") { ev.stopPropagation(); close(); return; }
+      if (ev.key !== "Tab") return;
+      var f = Array.prototype.slice.call(form.querySelectorAll("input:not([readonly]), select, button:not(:disabled)"));
+      if (!f.length) return;
+      var first = f[0], last = f[f.length - 1];
+      if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+      else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
+    }
+    document.addEventListener("keydown", onKey, true);
+    cancel.addEventListener("click", close);
+    backdrop.addEventListener("mousedown", function (ev) { if (ev.target === backdrop) close(); });
+
+    form.addEventListener("submit", async function (ev) {
+      ev.preventDefault();
+      err.textContent = "";
+      var values = {};
+      for (var i = 0; i < cfg.fields.length; i++) {
+        var f = cfg.fields[i];
+        var v = inputs[f.name].value.trim();
+        if (f.required && !v) {
+          err.textContent = f.label + " is required.";
+          inputs[f.name].focus();
+          return;
+        }
+        if (f.type === "number" && v !== "" && !(Number(v) >= 0)) {
+          err.textContent = f.label + " must be a number, zero or more.";
+          inputs[f.name].focus();
+          return;
+        }
+        values[f.name] = v;
+      }
+      save.disabled = true;
+      cancel.disabled = true;
+      try {
+        await cfg.onSubmit(values);
+        close();
+      } catch (e) {
+        err.textContent = friendly(e, cfg.dupMsg);
+        save.disabled = false;
+        cancel.disabled = false;
+      }
+    });
+
+    var firstEditable = cfg.fields.length ? inputs[cfg.fields.filter(function (f) { return !f.readonly; }).map(function (f) { return f.name; })[0]] : null;
+    if (firstEditable) firstEditable.focus();
+    return { close: close, inputs: inputs };
+  }
+
   /* ---------- mapping view ---------- */
   function boxMatches(b, q) {
     if (!q) return true;
@@ -217,17 +326,202 @@
     if (!p.codes.length) return el("p", { class: "muted", text: "No item codes for this product." });
     var head = el("tr", {}, [
       el("th", { text: "Item ID" }), el("th", { text: "Arabic name" }),
-      el("th", { class: "num", text: "Approved price" }), el("th", { class: "num", text: "Public price" })
+      el("th", { class: "num", text: "Approved price" }), el("th", { class: "num", text: "Public price" }),
+      el("th", { class: "act", text: "" })
     ]);
     var body = el("tbody", {}, p.codes.map(function (c) {
+      var edit = el("button", { type: "button", class: "btn sm", "data-act": "edit-code", "aria-label": "Edit item code " + c.item_id, text: "Edit" });
+      edit.addEventListener("click", function () { editCode(p, c); });
       return el("tr", {}, [
         el("td", { text: String(c.item_id) }),
         el("td", { dir: "rtl", text: c.arabic_name || "-" }),
         el("td", { class: "num", text: money(c.approved_price) }),
-        el("td", { class: "num", text: money(c.public_price) })
+        el("td", { class: "num", text: money(c.public_price) }),
+        el("td", { class: "act" }, [edit])
       ]);
     }));
     return el("div", { class: "scroll" }, [el("table", { class: "codes" }, [el("thead", {}, [head]), body])]);
+  }
+
+  function productActions(p) {
+    function btn(label, act, fn) {
+      var b = el("button", { type: "button", class: "btn sm", "data-act": act, text: label });
+      b.addEventListener("click", fn);
+      return b;
+    }
+    return el("div", { class: "actions" }, [
+      btn("Rename", "rename", function () { renameProduct(p); }),
+      btn("Add item code", "add-code", function () { addCode(p); }),
+      btn("Add to another line", "copy-line", function () { copyToLine(p); }),
+      btn(p.active ? "Mark discontinued" : "Reactivate", "toggle", function () { toggleProduct(p); })
+    ]);
+  }
+
+  /* ---------- products: edit actions ---------- */
+  async function refreshProducts() {
+    state.prodLoaded = false;
+    await loadProducts();
+    renderProducts();
+  }
+
+  function lineName(id) {
+    var l = state.lines.filter(function (x) { return x.id === id; })[0];
+    return l ? l.code : "";
+  }
+
+  function numOrNull(v) { return v === "" ? null : Number(v); }
+
+  function codeFields(opts) {
+    var req = !!opts.required;
+    return [
+      { name: "item_id", label: "Item ID", required: req, value: opts.item_id, readonly: !!opts.lockId, hint: opts.lockId ? "The item ID cannot be changed because sales are matched by it." : "Each item ID can belong to only one product." },
+      { name: "arabic_name", label: "Arabic name", dir: "rtl", value: opts.arabic_name },
+      { name: "approved_price", label: "Approved price", type: "number", value: opts.approved_price },
+      { name: "public_price", label: "Public price", type: "number", value: opts.public_price }
+    ];
+  }
+
+  function codeRow(productId, v) {
+    return {
+      item_id: v.item_id, product_id: productId,
+      arabic_name: v.arabic_name || null,
+      approved_price: numOrNull(v.approved_price), public_price: numOrNull(v.public_price)
+    };
+  }
+
+  function addProduct() {
+    var line = state.lineId;
+    openForm({
+      title: "Add product to " + lineName(line),
+      submitLabel: "Add product",
+      dupMsg: "This line already has a product with that name, or the item ID is already used.",
+      fields: [{ name: "name", label: "Product name", required: true }].concat(codeFields({ required: false })),
+      onSubmit: async function (v) {
+        var r = await sb.from("products").insert({ line_id: line, name: v.name, is_active: true }).select("id").single();
+        if (r.error) throw r.error;
+        if (v.item_id) {
+          var c = await sb.from("product_codes").insert(codeRow(r.data.id, v));
+          if (c.error) {
+            await refreshProducts();
+            $("app-error").textContent = "The product was added, but its item code was not: " + friendly(c.error, "that item ID is already used by another product.");
+            return;
+          }
+        }
+        await refreshProducts();
+        toast("Product added.");
+      }
+    });
+  }
+
+  function renameProduct(p) {
+    openForm({
+      title: "Rename product", submitLabel: "Save name",
+      dupMsg: "This line already has a product with that name.",
+      fields: [{ name: "name", label: "Product name", required: true, value: p.name }],
+      onSubmit: async function (v) {
+        var r = await sb.from("products").update({ name: v.name }).eq("id", p.id);
+        if (r.error) throw r.error;
+        await refreshProducts();
+        toast("Name saved.");
+      }
+    });
+  }
+
+  function toggleProduct(p) {
+    var to = !p.active;
+    openForm({
+      title: to ? "Reactivate " + p.name : "Mark " + p.name + " as discontinued",
+      intro: to ? "The product will count as active again." : "The product and its item codes stay in the system so old sales keep their names. Nothing is deleted.",
+      submitLabel: to ? "Reactivate" : "Mark discontinued",
+      fields: [],
+      onSubmit: async function () {
+        var r = await sb.from("products").update({ is_active: to }).eq("id", p.id);
+        if (r.error) throw r.error;
+        await refreshProducts();
+        toast(to ? "Product reactivated." : "Product marked discontinued.");
+      }
+    });
+  }
+
+  function addCode(p) {
+    openForm({
+      title: "Add item code to " + p.name, submitLabel: "Add item code",
+      dupMsg: "This item ID is already used by a product.",
+      fields: codeFields({ required: true }),
+      onSubmit: async function (v) {
+        var r = await sb.from("product_codes").insert(codeRow(p.id, v));
+        if (r.error) throw r.error;
+        state.popen[p.id] = true;
+        await refreshProducts();
+        toast("Item code added.");
+      }
+    });
+  }
+
+  function editCode(p, c) {
+    openForm({
+      title: "Edit item code " + c.item_id, submitLabel: "Save changes",
+      fields: codeFields({ lockId: true, required: true, item_id: c.item_id, arabic_name: c.arabic_name, approved_price: c.approved_price, public_price: c.public_price }),
+      onSubmit: async function (v) {
+        var r = await sb.from("product_codes").update({
+          arabic_name: v.arabic_name || null,
+          approved_price: numOrNull(v.approved_price), public_price: numOrNull(v.public_price)
+        }).eq("item_id", c.item_id);
+        if (r.error) throw r.error;
+        await refreshProducts();
+        toast("Item code saved.");
+      }
+    });
+  }
+
+  function copyToLine(p) {
+    var others = state.lines.filter(function (l) { return l.id !== p.lineId; });
+    if (!others.length) { $("app-error").textContent = "There is no other line to add this product to. Add a line first."; return; }
+    openForm({
+      title: "Add " + p.name + " to another line",
+      intro: "This creates a separate product in the other line, with its own sales and reports. Item IDs cannot be shared, so add the new line's own item ID if it has one.",
+      submitLabel: "Add to line",
+      dupMsg: "That line already has a product with this name, or the item ID is already used.",
+      fields: [
+        { name: "line_id", label: "Line", type: "select", required: true, options: others.map(function (l) { return { value: l.id, label: l.code }; }) },
+        { name: "name", label: "Product name", required: true, value: p.name }
+      ].concat(codeFields({ required: false })),
+      onSubmit: async function (v) {
+        var target = Number(v.line_id);
+        var r = await sb.from("products").insert({ line_id: target, name: v.name, is_active: true }).select("id").single();
+        if (r.error) throw r.error;
+        if (v.item_id) {
+          var c = await sb.from("product_codes").insert(codeRow(r.data.id, v));
+          if (c.error) {
+            await refreshProducts();
+            $("app-error").textContent = "The product was added to " + lineName(target) + ", but its item code was not: " + friendly(c.error, "that item ID is already used by another product.");
+            return;
+          }
+        }
+        await refreshProducts();
+        toast("Added to " + lineName(target) + ".");
+      }
+    });
+  }
+
+  function addLine() {
+    var next = state.lines.reduce(function (m, l) { return Math.max(m, l.sort_order || 0); }, 0) + 1;
+    openForm({
+      title: "Add line", submitLabel: "Add line",
+      intro: "You can add its products here, then its boxes and bricks in Mapping.",
+      dupMsg: "A line with this name already exists.",
+      fields: [{ name: "code", label: "Line name", required: true, hint: "For example: CIRA 4" }],
+      onSubmit: async function (v) {
+        var r = await sb.from("lines").insert({ code: v.code, sort_order: next, is_active: true }).select("id").single();
+        if (r.error) throw r.error;
+        state.lines = [];
+        await loadLines();
+        state.lineId = r.data.id;
+        state.mapLoaded = false;
+        await refreshProducts();
+        toast("Line added.");
+      }
+    });
   }
 
   function renderProductRows(rows) {
@@ -245,7 +539,7 @@
       tr.appendChild(el("td", { "data-label": "Status" }, [el("span", { class: "badge " + (p.active ? "ok" : "off"), text: p.active ? "Active" : "Discontinued" })]));
       tr.appendChild(el("td", { class: "num", "data-label": "Codes", text: String(p.codes.length) }));
       body.appendChild(tr);
-      if (state.popen[p.id]) body.appendChild(el("tr", { class: "detail" }, [el("td", { colspan: "3" }, [codesTable(p)])]));
+      if (state.popen[p.id]) body.appendChild(el("tr", { class: "detail" }, [el("td", { colspan: "3" }, [productActions(p), codesTable(p)])]));
     });
   }
 
@@ -391,6 +685,8 @@
 
   $("search").addEventListener("input", function (ev) { state.q = ev.target.value; renderMapping(); });
   $("p-search").addEventListener("input", function (ev) { state.pq = ev.target.value; renderProducts(); });
+  $("add-product").addEventListener("click", addProduct);
+  $("add-line").addEventListener("click", addLine);
 
   (async function init() {
     try {
