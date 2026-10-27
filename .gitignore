@@ -1,0 +1,8 @@
+# Never commit real data or secrets
+supabase/02_data*.sql
+supabase/*data*.sql
+*.xlsx
+*.xls
+*.csv
+.env
+*.env
