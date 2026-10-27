@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Sales Hub</title>
+  <link rel="icon" href="data:,">
   <style>
     body { font-family: system-ui, "Segoe UI", Tahoma, sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f5f7fa; color: #1b2430; }
     .card { background: #fff; padding: 32px 40px; border-radius: 14px; box-shadow: 0 4px 20px rgba(0,0,0,.08); text-align: center; max-width: 460px; }
@@ -20,30 +21,32 @@
     <p>(قيد الإعداد)</p>
     <div id="status">جاري فحص الاتصال بـ Supabase...</div>
   </div>
-  <script src="config.js?v=2"></script>
+  <script src="config.js?v=3"></script>
   <script>
     (async () => {
       const el = document.getElementById("status");
-      const fail = (msg) => { el.textContent = "تعذّر الاتصال ❌ " + msg; el.className = "bad"; };
-      try {
-        const cfg = window.SALES_HUB_CONFIG;
-        if (!cfg) return fail("config.js لم يتحمّل");
+      const cfg = window.SALES_HUB_CONFIG;
+      if (!cfg) { el.textContent = "config.js لم يتحمّل ❌"; el.className = "bad"; return; }
+
+      async function probe(label, url, opts) {
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 10000);
-        const r = await fetch(cfg.SUPABASE_URL + "/auth/v1/health", {
-          headers: { apikey: cfg.SUPABASE_ANON_KEY },
-          signal: ctrl.signal,
-        });
-        clearTimeout(timer);
-        if (r.ok) {
-          el.textContent = "الاتصال بـ Supabase شغال ✅";
-          el.className = "ok";
-        } else {
-          fail("HTTP " + r.status);
-        }
-      } catch (e) {
-        fail(e.name === "AbortError" ? "انتهت المهلة (10 ثواني)" : e.message);
+        try {
+          const r = await fetch(url, { ...opts, signal: ctrl.signal });
+          return label + ": HTTP " + r.status + (r.ok ? " ✅" : " ❌");
+        } catch (e) {
+          return label + ": " + (e.name === "AbortError" ? "timeout ❌" : e.message + " ❌");
+        } finally { clearTimeout(timer); }
       }
+
+      const base = cfg.SUPABASE_URL + "/auth/v1/health";
+      // A: simple GET, key in URL, no custom headers => no CORS preflight
+      const a = await probe("A (no preflight)", base + "?apikey=" + encodeURIComponent(cfg.SUPABASE_ANON_KEY), {});
+      // B: apikey header => browser sends a CORS preflight first (what supabase-js does)
+      const b = await probe("B (with preflight)", base, { headers: { apikey: cfg.SUPABASE_ANON_KEY } });
+
+      el.innerHTML = a + "<br>" + b;
+      el.className = (a.includes("✅") && b.includes("✅")) ? "ok" : "bad";
     })();
   </script>
 </body>
